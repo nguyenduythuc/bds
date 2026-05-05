@@ -1,15 +1,24 @@
 """
 Crawl chung cư HN từ batdongsan.com.vn
-- Mỗi tin đăng lưu 1 dòng riêng (không tổng hợp)
-- Dự án mới tự động geocode (Nominatim OSM) sau mỗi lần crawl
+
+Modes:
+  projects  — Khám phá tất cả dự án từ /du-an/can-ho-chung-cu-ha-noi
+  listings  — Crawl tin đăng cho từng dự án đã có trong DB
+  all       — Cả hai (default)
+  generic   — Crawl trang listing tổng (legacy)
 
 Schema:
-  projects  (project_slug PK, project_name, district, ward, lat, lng, ...)
-  listings  (listing_id + crawl_month PK, project_slug FK, price_ty, area_m2,
-             price_per_m2, bedrooms, bathrooms, post_date, post_month, ...)
+  projects  (project_slug PK, project_name, developer, district, ward,
+             status, price_min, price_max, total_units, listing_url,
+             lat, lng, geocoded, first_seen, crawl_date, detail_crawled)
+  listings  (listing_id + crawl_month PK, project_slug FK, price_ty,
+             area_m2, price_per_m2, bedrooms, bathrooms,
+             district, ward, post_date, post_month, title, url, crawl_date)
+  crawl_runs (id, mode, started_at, finished_at, pages_done, items_new, total_pages)
 """
 
 import re
+import math
 import asyncio
 import sqlite3
 import logging
@@ -19,17 +28,24 @@ import json
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-BASE_URL    = "https://batdongsan.com.vn"
-LIST_SLUG   = "ban-can-ho-chung-cu-tp-ha-noi"
-LIST_URL    = f"{BASE_URL}/{LIST_SLUG}"
-DB_PATH     = "batdongsan.db"
-PAGE_DELAY  = 2.5
-NAV_TIMEOUT = 40_000
+BASE_URL          = "https://batdongsan.com.vn"
+LIST_SLUG         = "ban-can-ho-chung-cu-tp-ha-noi"
+LIST_URL          = f"{BASE_URL}/{LIST_SLUG}"
+PROJECT_LIST_URL  = f"{BASE_URL}/du-an/can-ho-chung-cu-ha-noi"
+PROJECT_API_URL   = (f"{BASE_URL}/microservice-architecture-router"
+                     f"/ProjectNet/ProjectSearch/GetProjectListData")
+PROJECT_CATE_ID   = 155   # can-ho-chung-cu
+PROJECT_CITY_CODE = "HN"
+PROJECT_PAGE_SIZE = 10    # cards per page (confirmed from API)
+DB_PATH           = "batdongsan.db"
+PAGE_DELAY        = 1.5   # giây giữa các API calls (nhẹ hơn DOM scraping)
+NAV_TIMEOUT       = 40_000
 
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
@@ -45,13 +61,20 @@ def init_db(path: str) -> sqlite3.Connection:
             project_slug    TEXT PRIMARY KEY,
             project_id      TEXT,
             project_name    TEXT,
+            developer       TEXT,
             district        TEXT,
             ward            TEXT,
+            status          TEXT,
+            price_min       REAL,
+            price_max       REAL,
+            total_units     INTEGER,
+            listing_url     TEXT,
             lat             REAL,
             lng             REAL,
             geocoded        INTEGER DEFAULT 0,
             first_seen      TEXT,
-            crawl_date      TEXT
+            crawl_date      TEXT,
+            detail_crawled  TEXT
         )
     """)
     con.execute("""
@@ -86,27 +109,41 @@ def init_db(path: str) -> sqlite3.Connection:
         )
     """)
 
-    # Migrate existing listings table: add columns introduced in new schema
-    existing = {row[1] for row in con.execute("PRAGMA table_info(listings)")}
-    for col, definition in [
+    # Migrate existing tables — additive only, never drops
+    existing_proj = {row[1] for row in con.execute("PRAGMA table_info(projects)")}
+    for col, defn in [
+        ("developer",      "TEXT"),
+        ("status",         "TEXT"),
+        ("price_min",      "REAL"),
+        ("price_max",      "REAL"),
+        ("total_units",    "INTEGER"),
+        ("listing_url",    "TEXT"),
+        ("detail_crawled", "TEXT"),
+        ("project_id",     "TEXT"),
+    ]:
+        if col not in existing_proj:
+            con.execute(f"ALTER TABLE projects ADD COLUMN {col} {defn}")
+            log.info(f"Migration: added projects.{col}")
+
+    existing_lst = {row[1] for row in con.execute("PRAGMA table_info(listings)")}
+    for col, defn in [
         ("post_date",    "TEXT"),
         ("post_month",   "TEXT"),
         ("project_slug", "TEXT"),
     ]:
-        if col not in existing:
-            con.execute(f"ALTER TABLE listings ADD COLUMN {col} {definition}")
-            log.info(f"Migration: added column listings.{col}")
+        if col not in existing_lst:
+            con.execute(f"ALTER TABLE listings ADD COLUMN {col} {defn}")
+            log.info(f"Migration: added listings.{col}")
 
-    # Migrate crawl_runs: add columns introduced in new schema
     existing_runs = {row[1] for row in con.execute("PRAGMA table_info(crawl_runs)")}
-    for col, definition in [
+    for col, defn in [
         ("mode",        "TEXT"),
         ("items_new",   "INTEGER DEFAULT 0"),
         ("total_pages", "INTEGER DEFAULT 0"),
     ]:
         if col not in existing_runs:
-            con.execute(f"ALTER TABLE crawl_runs ADD COLUMN {col} {definition}")
-            log.info(f"Migration: added column crawl_runs.{col}")
+            con.execute(f"ALTER TABLE crawl_runs ADD COLUMN {col} {defn}")
+            log.info(f"Migration: added crawl_runs.{col}")
 
     con.execute("CREATE INDEX IF NOT EXISTS idx_listings_project   ON listings(project_slug)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_listings_postmonth ON listings(post_month)")
@@ -139,6 +176,22 @@ def parse_price_m2(text: str) -> float | None:
     return float(m.group(1).replace(",", ".")) if m else None
 
 
+def parse_project_prices(text: str) -> tuple[float | None, float | None]:
+    """
+    'Từ 3 tỷ đến 5 tỷ'  → (3.0, 5.0)
+    'Từ 50 triệu/m²'     → (None, None)  — m²-based prices skipped
+    '3 - 5 tỷ'           → (3.0, 5.0)
+    """
+    t = text.lower()
+    vals = re.findall(r"([\d,\.]+)\s*tỷ", t)
+    floats = [float(v.replace(",", ".")) for v in vals]
+    if len(floats) >= 2:
+        return min(floats), max(floats)
+    if len(floats) == 1:
+        return floats[0], None
+    return None, None
+
+
 def extract_project_from_url(href: str) -> tuple[str | None, str | None]:
     """
     '/ban-can-ho-chung-cu-imperia-sky-park-phuong-dai-mo-tp-ha-noi/pr123'
@@ -158,11 +211,36 @@ def extract_project_from_url(href: str) -> tuple[str | None, str | None]:
     return slug, slug.replace("-", " ").title()
 
 
+def slug_from_du_an_href(href: str) -> tuple[str | None, str | None]:
+    """
+    '/du-an-can-ho/vinhomes-ocean-park-pj1234' → ('vinhomes-ocean-park', '1234')
+    '/du-an/imperia-sky-park-ha-noi'           → ('imperia-sky-park', None)
+    Returns (project_slug, project_id)
+    """
+    path = href.lstrip("/").split("?")[0].rstrip("/")
+    if not path.startswith("du-an"):
+        return None, None
+
+    # Lấy phần cuối của path (project slug + optional pj{id})
+    last = path.split("/")[-1]
+
+    # Tách project_id từ suffix -pj{digits}
+    project_id = None
+    m = re.search(r"-pj(\d+)$", last)
+    if m:
+        project_id = m.group(1)
+        last = last[:m.start()]
+
+    # Strip location suffixes
+    slug = re.sub(
+        r"-(phuong|quan|huyen|thi-xa|thi-tran)-[\w-]+-tp-ha-noi$"
+        r"|-tp-ha-noi$|-ha-noi$|-tp-hcm$",
+        "", last,
+    )
+    return (slug if slug and len(slug) >= 3 else None), project_id
+
+
 def parse_district_ward(location_text: str) -> tuple[str, str]:
-    """
-    'P. Đại Mỗ (Q. Nam Từ Liêm cũ)' → ('Nam Từ Liêm', 'Đại Mỗ')
-    'Q. Hoàng Mai'                    → ('Hoàng Mai', '')
-    """
     ward_m = re.search(r"(?:^|\n)\s*P\.\s*([^(\n]+?)(?:\s*\(|$)", location_text)
     ward = ward_m.group(1).strip() if ward_m else ""
 
@@ -174,15 +252,10 @@ def parse_district_ward(location_text: str) -> tuple[str, str]:
 
 
 def resolve_post_date(text: str, today: datetime) -> tuple[str | None, str | None]:
-    """
-    Chuyển ngày đăng tương đối → (post_date yyyy-mm-dd, post_month yyyy-mm)
-    Ví dụ: '2 ngày trước' → ('2026-05-01', '2026-05')
-    """
     if not text:
         return None, None
     t = text.lower().strip()
 
-    # Ngày tuyệt đối: dd/mm/yyyy hoặc dd-mm-yyyy
     m = re.search(r"(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})", t)
     if m:
         try:
@@ -200,7 +273,6 @@ def resolve_post_date(text: str, today: datetime) -> tuple[str | None, str | Non
         m_d  = re.search(r"(\d+)\s*ngày", t)
         m_w  = re.search(r"(\d+)\s*tuần", t)
         m_mo = re.search(r"(\d+)\s*tháng", t)
-
         if m_h:
             d = today
         elif m_d:
@@ -218,19 +290,15 @@ def resolve_post_date(text: str, today: datetime) -> tuple[str | None, str | Non
 # ─── Geocoding (Nominatim) ────────────────────────────────────────────────────
 
 def geocode_nominatim(query: str) -> tuple[float | None, float | None]:
-    """Gọi Nominatim OSM. Tuân thủ rate-limit 1 req/giây."""
     params = urllib.parse.urlencode({
-        "q": query,
-        "format": "json",
-        "limit": 1,
-        "countrycodes": "vn",
+        "q": query, "format": "json", "limit": 1, "countrycodes": "vn",
     })
     url = f"https://nominatim.openstreetmap.org/search?{params}"
     req = urllib.request.Request(
         url, headers={"User-Agent": "batdongsan-hanoi-research/1.0 duythucbk@gmail.com"}
     )
     try:
-        time.sleep(1.2)  # Nominatim ToS: tối đa 1 req/giây
+        time.sleep(1.2)
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read())
             if data:
@@ -241,7 +309,6 @@ def geocode_nominatim(query: str) -> tuple[float | None, float | None]:
 
 
 def geocode_all_projects(con: sqlite3.Connection) -> None:
-    """Geocode tất cả dự án có geocoded=0."""
     rows = con.execute("""
         SELECT project_slug, project_name, district, ward
         FROM projects
@@ -251,32 +318,25 @@ def geocode_all_projects(con: sqlite3.Connection) -> None:
 
     log.info(f"Geocoding {len(rows)} dự án chưa có tọa độ...")
     ok = fail = 0
-
     for slug, name, district, ward in rows:
-        # Thử query chi tiết nhất trước
         parts = [p for p in [name, ward, district, "Hà Nội"] if p]
         lat, lng = geocode_nominatim(", ".join(parts))
-
         if lat is None and district:
             lat, lng = geocode_nominatim(f"{name}, {district}, Hà Nội")
-
         if lat is None:
             lat, lng = geocode_nominatim(f"{name}, Hà Nội")
-
         geocoded = 1 if lat else -1
         con.execute(
             "UPDATE projects SET lat=?, lng=?, geocoded=? WHERE project_slug=?",
             (lat, lng, geocoded, slug),
         )
         con.commit()
-
         if lat:
             ok += 1
             log.info(f"  ✓ {name} → ({lat:.5f}, {lng:.5f})")
         else:
             fail += 1
             log.warning(f"  ✗ {name} [{slug}] không tìm được tọa độ")
-
     log.info(f"Geocoding xong: {ok} thành công, {fail} thất bại.")
 
 
@@ -284,20 +344,52 @@ def geocode_all_projects(con: sqlite3.Connection) -> None:
 
 def upsert_project(
     con: sqlite3.Connection,
-    slug: str, name: str, district: str, ward: str,
-    crawl_month: str, crawl_date: str,
+    slug: str,
+    name: str,
+    district: str,
+    ward: str,
+    crawl_month: str,
+    crawl_date: str,
+    *,
+    developer: str = "",
+    status: str = "",
+    price_min: float | None = None,
+    price_max: float | None = None,
+    total_units: int | None = None,
+    listing_url: str = "",
+    detail_crawled: str = "",
+    project_id: str = "",
 ) -> None:
-    """Thêm dự án nếu chưa có; bổ sung district/ward nếu còn trống."""
     con.execute("""
-        INSERT INTO projects (project_slug, project_name, district, ward, first_seen, crawl_date)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO projects
+            (project_slug, project_name, developer, district, ward,
+             status, price_min, price_max, total_units, listing_url,
+             first_seen, crawl_date, detail_crawled, project_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(project_slug) DO UPDATE SET
-            project_name = COALESCE(projects.project_name, excluded.project_name),
-            district     = CASE WHEN projects.district = '' OR projects.district IS NULL
-                                THEN excluded.district ELSE projects.district END,
-            ward         = CASE WHEN projects.ward = '' OR projects.ward IS NULL
-                                THEN excluded.ward ELSE projects.ward END
-    """, (slug, name, district, ward, crawl_month, crawl_date))
+            project_name   = COALESCE(projects.project_name,  excluded.project_name),
+            developer      = CASE WHEN excluded.developer != '' THEN excluded.developer
+                                  ELSE projects.developer END,
+            district       = CASE WHEN (projects.district = '' OR projects.district IS NULL)
+                                  THEN excluded.district ELSE projects.district END,
+            ward           = CASE WHEN (projects.ward = '' OR projects.ward IS NULL)
+                                  THEN excluded.ward ELSE projects.ward END,
+            status         = CASE WHEN excluded.status != '' THEN excluded.status
+                                  ELSE projects.status END,
+            price_min      = COALESCE(excluded.price_min, projects.price_min),
+            price_max      = COALESCE(excluded.price_max, projects.price_max),
+            total_units    = COALESCE(excluded.total_units, projects.total_units),
+            listing_url    = CASE WHEN excluded.listing_url != '' THEN excluded.listing_url
+                                  ELSE projects.listing_url END,
+            detail_crawled = CASE WHEN excluded.detail_crawled != '' THEN excluded.detail_crawled
+                                  ELSE projects.detail_crawled END,
+            project_id     = CASE WHEN excluded.project_id != '' THEN excluded.project_id
+                                  ELSE projects.project_id END
+    """, (
+        slug, name, developer, district, ward,
+        status, price_min, price_max, total_units, listing_url,
+        crawl_month, crawl_date, detail_crawled, project_id,
+    ))
 
 
 def save_listings(con: sqlite3.Connection, listings: list[dict]) -> int:
@@ -320,13 +412,14 @@ def save_listings(con: sqlite3.Connection, listings: list[dict]) -> int:
             ))
             saved += con.execute("SELECT changes()").fetchone()[0]
         except Exception as e:
-            log.warning(f"DB insert lỗi cho {item['listing_id']}: {e}")
+            log.warning(f"DB insert lỗi cho {item.get('listing_id')}: {e}")
     con.commit()
     return saved
 
 
-# ─── JS extraction ────────────────────────────────────────────────────────────
+# ─── JS snippets ──────────────────────────────────────────────────────────────
 
+# Dùng cho trang listing (ban-can-ho-chung-cu-...)
 EXTRACT_JS = """
 () => {
     return Array.from(document.querySelectorAll('.re__card-full')).map(card => {
@@ -352,15 +445,55 @@ PAGINATION_JS = """
 () => {
     const links = Array.from(document.querySelectorAll('[class*="pagination"] a'));
     const nums = links.map(a => {
-        const m = a.href.match(/\/p(\d+)$/);
+        const m = (a.href || '').match(/\/p(\d+)(?:\?|$)/);
         return m ? parseInt(m[1]) : 0;
     }).filter(n => n > 0);
     return nums.length ? Math.max(...nums) : 1;
 }
 """
 
+# Dùng cho trang dự án (/du-an/can-ho-chung-cu-ha-noi)
+# Selectors đã verify qua --inspect (05-2026)
+PROJECT_EXTRACT_JS = """
+() => {
+    const cards = Array.from(document.querySelectorAll('.js__project-card'));
+    return cards.map(card => {
+        const anchor = card.querySelector('a.re__clearfix');
+        const href   = anchor?.getAttribute('href') || '';
 
-# ─── Card parsing ─────────────────────────────────────────────────────────────
+        const titleEl  = card.querySelector('h3.re__prj-card-title');
+        const locEl    = card.querySelector('.re__prj-card-location');
+        const priceEl  = card.querySelector('.re__prj-card-config-value');
+        const devEl    = card.querySelector('.re__prj-card-contact-avatar');
+        const unitsEl  = card.querySelector('[aria-label*="\\u0103n h\\u1ed9"]');
+
+        // Status: lấy text của label bên trong div status
+        const statusDiv = card.querySelector(
+            '.re__project-open, .re__project-finish, .re__project-prepare, .re__project-na'
+        );
+        const statusLabel = statusDiv?.querySelector('label');
+
+        // Config values: [diện tích ha, số căn hộ (icon home), số tòa (icon building)]
+        const configs = Array.from(card.querySelectorAll('.re__prj-card-config-value'))
+                            .map(el => ({
+                                text: el.innerText.trim(),
+                                label: el.getAttribute('aria-label') || '',
+                            }));
+
+        return {
+            href:       href,
+            name:       (titleEl?.innerText  || '').trim(),
+            developer:  (devEl?.getAttribute('aria-label') || devEl?.innerText || '').trim(),
+            location:   (locEl?.getAttribute('title') || locEl?.innerText || '').trim(),
+            status:     (statusLabel?.innerText || statusDiv?.innerText || '').trim(),
+            configs:    configs,
+        };
+    }).filter(p => p.href || p.name);
+}
+"""
+
+
+# ─── Card parsing (cho trang listing) ────────────────────────────────────────
 
 def parse_cards(
     raw_cards: list[dict],
@@ -414,11 +547,11 @@ def parse_cards(
 
 # ─── Navigation ───────────────────────────────────────────────────────────────
 
-async def nav_with_retry(page, url: str, retries: int = 3) -> bool:
+async def nav_with_retry(page, url: str, selector: str = ".re__card-full", retries: int = 3) -> bool:
     for attempt in range(1, retries + 1):
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-            await page.wait_for_selector(".re__card-full", timeout=15_000)
+            await page.wait_for_selector(selector, timeout=15_000)
             return True
         except Exception as e:
             log.warning(f"Nav lần {attempt}/{retries} thất bại cho {url}: {e}")
@@ -427,41 +560,307 @@ async def nav_with_retry(page, url: str, retries: int = 3) -> bool:
     return False
 
 
-# ─── Crawl listings ──────────────────────────────────────────────────────────
+# ─── Project API helpers ──────────────────────────────────────────────────────
 
-async def crawl_listings(max_pages: int, start_page: int, db_path: str) -> None:
+def _api_body(page_index: int) -> str:
+    params = {
+        "TextSearch": "", "CateId": PROJECT_CATE_ID, "CityCode": PROJECT_CITY_CODE,
+        "DistrictId": 0, "PriceLevel": -1, "PriceMin": -1, "PriceMax": -1,
+        "LegacyId": 0, "StagesAsString": "", "OrderBy": 1, "PageIndex": page_index,
+    }
+    return urllib.parse.urlencode(params)
+
+
+def parse_project_cards(html: str, crawl_date: str, crawl_month: str, con) -> int:
+    """Parse project cards từ HTML fragment của API. Upsert vào DB. Trả về số mới."""
+    soup = BeautifulSoup(html, "html.parser")
+    cards = soup.select(".js__project-card")
+    count = 0
+    for card in cards:
+        anchor = card.select_one("a.re__clearfix")
+        href   = anchor.get("href", "") if anchor else ""
+        name   = card.select_one("h3.re__prj-card-title")
+        name   = name.get_text(strip=True) if name else ""
+
+        # Developer từ aria-label của avatar
+        dev_el    = card.select_one(".re__prj-card-contact-avatar")
+        developer = (dev_el.get("aria-label") or dev_el.get_text(strip=True)) if dev_el else ""
+
+        # Location từ title attribute (đầy đủ hơn innerText)
+        loc_el   = card.select_one(".re__prj-card-location")
+        location = loc_el.get("title") or loc_el.get_text(strip=True) if loc_el else ""
+
+        # Status: label bên trong div status
+        status_div = card.select_one(
+            ".re__project-open, .re__project-finish, .re__project-prepare, .re__project-na"
+        )
+        status_lbl = status_div.select_one("label") if status_div else None
+        status     = status_lbl.get_text(strip=True) if status_lbl else ""
+
+        # Số căn hộ từ aria-label
+        total_units = None
+        for cfg in card.select(".re__prj-card-config-value"):
+            lbl = cfg.get("aria-label", "")
+            m   = re.search(r"([\d\.]+)\s*căn", lbl)
+            if m:
+                try:
+                    total_units = int(m.group(1).replace(".", "").replace(",", ""))
+                except ValueError:
+                    pass
+
+        slug, project_id = slug_from_du_an_href(href)
+        if not slug and name:
+            slug = re.sub(r"[^\w\-]+", "-", name.lower()).strip("-")
+        if not slug:
+            continue
+
+        district, ward = parse_district_ward(location)
+        listing_url = f"nha-dat-ban-{slug}"
+
+        upsert_project(
+            con, slug, name, district, ward, crawl_month, crawl_date,
+            developer=developer,
+            status=status,
+            total_units=total_units,
+            listing_url=listing_url,
+            detail_crawled=crawl_date,
+            project_id=project_id or "",
+        )
+        count += 1
+        log.debug(f"  {name} [{slug}] pj={project_id} dev={developer}")
+    con.commit()
+    return count
+
+
+# ─── Crawl: project discovery (API-based) ─────────────────────────────────────
+
+async def crawl_projects(max_pages: int, db_path: str, inspect: bool = False, skip_geocode: bool = False) -> None:
+    """
+    Khám phá tất cả dự án chung cư HN qua API.
+    Playwright chỉ dùng 1 lần để bypass Cloudflare,
+    sau đó dùng page.evaluate(fetch()) cho mọi trang — không cần navigate.
+    """
     con = init_db(db_path)
     now = datetime.now()
     crawl_date  = now.strftime("%Y-%m-%d")
     crawl_month = now.strftime("%Y-%m")
     run_start   = now.isoformat()
+    pages_done  = projects_new = total_pages = 0
 
-    pages_done = listings_new = total_pages = 0
+    FETCH_JS = f"""async (body) => {{
+        const resp = await fetch('{PROJECT_API_URL}', {{
+            method: 'POST',
+            headers: {{
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'X-Requested-With': 'XMLHttpRequest',
+                'Accept': '*/*',
+            }},
+            body: body,
+        }});
+        return {{ status: resp.status, text: await resp.text() }};
+    }}"""
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
-            channel="chrome",
-            headless=True,
+            channel="chrome", headless=True,
             args=["--disable-blink-features=AutomationControlled"],
         )
         ctx = await browser.new_context(
-            user_agent=UA,
-            locale="vi-VN",
-            viewport={"width": 1280, "height": 900},
+            user_agent=UA, locale="vi-VN", viewport={"width": 1280, "height": 900},
         )
         page = await ctx.new_page()
 
-        log.info(f"Crawl listings tháng {crawl_month} | DB: {db_path}")
+        log.info(f"Loading {PROJECT_LIST_URL} (Cloudflare bypass)...")
+        ok = await nav_with_retry(page, PROJECT_LIST_URL, ".js__project-card", retries=3)
+        if not ok:
+            log.error("Không load được trang dự án.")
+            await browser.close()
+            return
+        log.info("Page loaded. Dùng API cho tất cả trang tiếp theo.")
+
+        async def fetch_page(page_index: int) -> dict | None:
+            """Gọi API qua fetch() trong browser context. Trả về parsed JSON."""
+            for attempt in range(1, 4):
+                try:
+                    result = await page.evaluate(FETCH_JS, _api_body(page_index))
+                    if result["status"] != 200:
+                        log.warning(f"  API trang {page_index} status={result['status']}")
+                        return None
+                    return json.loads(result["text"])
+                except Exception as e:
+                    log.warning(f"  fetch_page({page_index}) lần {attempt}: {e}")
+                    if attempt < 3:
+                        await asyncio.sleep(attempt * 2)
+            return None
+
+        # Trang 1: lấy total count để tính total_pages
+        data = await fetch_page(1)
+        if not data:
+            log.error("Không lấy được data trang 1.")
+            await browser.close()
+            return
+
+        html1 = data.get("projectListContent", "")
+
+        # Extract total từ "Hiện đang có 127 dự án"
+        m_total = re.search(r"(\d+)\s*</span>\s*dự án", html1)
+        total_projects = int(m_total.group(1)) if m_total else 0
+        total_pages = math.ceil(total_projects / PROJECT_PAGE_SIZE) if total_projects else 1
+        if max_pages > 0:
+            total_pages = min(total_pages, max_pages)
+        log.info(f"Tổng dự án: {total_projects} → {total_pages} trang")
+
+        new = parse_project_cards(html1, crawl_date, crawl_month, con)
+        projects_new += new
+        pages_done   += 1
+        log.info(f"Trang 1/{total_pages} — +{new} dự án")
+
+        for pnum in range(2, total_pages + 1):
+            await asyncio.sleep(PAGE_DELAY)
+            data = await fetch_page(pnum)
+            if not data:
+                log.warning(f"Bỏ qua trang {pnum}")
+                continue
+            new = parse_project_cards(data.get("projectListContent", ""), crawl_date, crawl_month, con)
+            projects_new += new
+            pages_done   += 1
+            log.info(f"Trang {pnum}/{total_pages} — +{new} dự án (tổng: {projects_new})")
+
+        await browser.close()
+
+    con.execute("""
+        INSERT INTO crawl_runs (mode, started_at, finished_at, pages_done, items_new, total_pages)
+        VALUES (?,?,?,?,?,?)
+    """, ("projects", run_start, datetime.now().isoformat(), pages_done, projects_new, total_pages))
+    con.commit()
+    if not skip_geocode:
+        geocode_all_projects(con)
+    else:
+        log.info("Skip geocoding (--skip-geocode). Chạy lại không có flag để geocode.")
+    con.close()
+    log.info(f"Projects xong: {projects_new} dự án từ {pages_done} trang.")
+
+
+# ─── Crawl: per-project listings ─────────────────────────────────────────────
+
+async def crawl_project_listings(
+    max_pages: int,
+    db_path: str,
+) -> None:
+    """Crawl tin đăng cho từng dự án đã có trong DB."""
+    con = init_db(db_path)
+    now = datetime.now()
+    crawl_date  = now.strftime("%Y-%m-%d")
+    crawl_month = now.strftime("%Y-%m")
+    run_start   = now.isoformat()
+    total_new   = 0
+
+    # Lấy danh sách dự án có listing_url, ưu tiên dự án chưa crawl tháng này
+    projects = con.execute("""
+        SELECT project_slug, project_name, listing_url
+        FROM projects
+        WHERE listing_url IS NOT NULL AND listing_url != ''
+        ORDER BY detail_crawled ASC NULLS FIRST
+    """).fetchall()
+
+    if not projects:
+        log.warning("Không có dự án nào có listing_url. Chạy --mode projects trước.")
+        con.close()
+        return
+
+    log.info(f"Crawl listings cho {len(projects)} dự án | tháng {crawl_month}")
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            channel="chrome", headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        ctx = await browser.new_context(
+            user_agent=UA, locale="vi-VN", viewport={"width": 1280, "height": 900},
+        )
+        page = await ctx.new_page()
+
+        for slug, name, listing_url in projects:
+            base = BASE_URL + "/" + listing_url.lstrip("/")
+            log.info(f"  Dự án: {name} [{slug}] → {base}")
+
+            ok = await nav_with_retry(page, base, ".re__card-full", retries=2)
+            if not ok:
+                log.warning(f"  Skip {slug} — không load được trang listing")
+                continue
+
+            tot = await page.evaluate(PAGINATION_JS)
+            if max_pages > 0:
+                tot = min(tot, max_pages)
+
+            proj_new = 0
+
+            async def do_page() -> int:
+                raw   = await page.evaluate(EXTRACT_JS)
+                cards = parse_cards(raw, crawl_date, crawl_month, now)
+                for c in cards:
+                    # Override project_slug về slug đã biết
+                    c["project_slug"] = slug
+                return save_listings(con, cards)
+
+            proj_new += await do_page()
+
+            for pnum in range(2, tot + 1):
+                await asyncio.sleep(PAGE_DELAY)
+                url = f"{base}/p{pnum}"
+                ok = await nav_with_retry(page, url, ".re__card-full", retries=2)
+                if not ok:
+                    log.warning(f"  Skip trang {pnum} của {slug}")
+                    continue
+                proj_new += await do_page()
+
+            total_new += proj_new
+            log.info(f"  ✓ {name}: +{proj_new} tin mới")
+            await asyncio.sleep(PAGE_DELAY)
+
+        await browser.close()
+
+    con.execute("""
+        INSERT INTO crawl_runs (mode, started_at, finished_at, pages_done, items_new, total_pages)
+        VALUES (?,?,?,?,?,?)
+    """, ("project-listings", run_start, datetime.now().isoformat(),
+          len(projects), total_new, len(projects)))
+    con.commit()
+    con.close()
+    log.info(f"Xong: {total_new} tin mới từ {len(projects)} dự án.")
+
+
+# ─── Crawl: generic listing (legacy) ─────────────────────────────────────────
+
+async def crawl_listings(max_pages: int, start_page: int, db_path: str) -> None:
+    """Crawl trang listing tổng (legacy mode — không phân theo dự án)."""
+    con = init_db(db_path)
+    now = datetime.now()
+    crawl_date  = now.strftime("%Y-%m-%d")
+    crawl_month = now.strftime("%Y-%m")
+    run_start   = now.isoformat()
+    pages_done  = listings_new = total_pages = 0
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            channel="chrome", headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        ctx = await browser.new_context(
+            user_agent=UA, locale="vi-VN", viewport={"width": 1280, "height": 900},
+        )
+        page = await ctx.new_page()
+        log.info(f"[generic] Crawl listings tháng {crawl_month}")
         url1 = LIST_URL if start_page == 1 else f"{LIST_URL}/p{start_page}"
         if not await nav_with_retry(page, url1):
-            log.error("Không thể load trang đầu, dừng.")
+            log.error("Không thể load trang đầu.")
             await browser.close()
             return
 
         total_pages = await page.evaluate(PAGINATION_JS)
         if max_pages > 0:
             total_pages = min(total_pages, start_page - 1 + max_pages)
-        log.info(f"Tổng số trang: {total_pages} | Bắt đầu từ trang {start_page}")
+        log.info(f"Tổng trang: {total_pages}")
 
         async def process_page(p_num: int) -> int:
             raw   = await page.evaluate(EXTRACT_JS)
@@ -477,7 +876,7 @@ async def crawl_listings(max_pages: int, start_page: int, db_path: str) -> None:
         new = await process_page(start_page)
         listings_new += new
         pages_done   += 1
-        log.info(f"Trang {start_page}/{total_pages} — +{new} tin (tổng: {listings_new})")
+        log.info(f"Trang {start_page}/{total_pages} — +{new} tin")
 
         for pnum in range(start_page + 1, total_pages + 1):
             await asyncio.sleep(PAGE_DELAY)
@@ -490,31 +889,61 @@ async def crawl_listings(max_pages: int, start_page: int, db_path: str) -> None:
             pages_done   += 1
             if pages_done % 10 == 0:
                 log.info(f"Trang {pnum}/{total_pages} — +{new} tin (tổng: {listings_new})")
-            else:
-                log.debug(f"Trang {pnum}/{total_pages} — +{new}")
 
         await browser.close()
 
     con.execute("""
         INSERT INTO crawl_runs (mode, started_at, finished_at, pages_done, items_new, total_pages)
         VALUES (?,?,?,?,?,?)
-    """, ("listings", run_start, datetime.now().isoformat(), pages_done, listings_new, total_pages))
+    """, ("generic", run_start, datetime.now().isoformat(), pages_done, listings_new, total_pages))
     con.commit()
-
-    # Geocode dự án mới phát hiện trong lần crawl này
     geocode_all_projects(con)
-
     con.close()
-    log.info(f"Hoàn thành: {pages_done} trang, {listings_new} tin mới → {db_path}")
+    log.info(f"Generic xong: {pages_done} trang, {listings_new} tin mới.")
 
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Crawl chung cư HN từ batdongsan.com.vn")
-    ap.add_argument("--max-pages",  type=int, default=0,   help="Giới hạn số trang (0=tất cả)")
-    ap.add_argument("--start-page", type=int, default=1,   help="Bắt đầu từ trang nào (resume)")
-    ap.add_argument("--db",         default=DB_PATH,       help="Đường dẫn file SQLite")
+    ap.add_argument(
+        "--mode", default="all",
+        choices=["all", "projects", "listings", "generic"],
+        help=(
+            "all=khám phá dự án + crawl listings theo dự án | "
+            "projects=chỉ khám phá dự án | "
+            "listings=chỉ crawl listings theo dự án đã có | "
+            "generic=crawl trang listing tổng (legacy)"
+        ),
+    )
+    ap.add_argument("--max-project-pages", type=int, default=0,
+                    help="Giới hạn số trang /du-an/ (0=tất cả)")
+    ap.add_argument("--max-listing-pages", type=int, default=0,
+                    help="Giới hạn số trang listing per dự án (0=tất cả)")
+    ap.add_argument("--max-pages",  type=int, default=0,
+                    help="Alias cho --max-listing-pages (legacy / generic mode)")
+    ap.add_argument("--start-page", type=int, default=1,
+                    help="Bắt đầu từ trang nào — chỉ dùng cho mode=generic")
+    ap.add_argument("--db", default=DB_PATH, help="Đường dẫn file SQLite")
+    ap.add_argument("--inspect", action="store_true",
+                    help="Dump HTML trang /du-an/ ra /tmp để kiểm tra selectors, rồi thoát")
+    ap.add_argument("--skip-geocode", action="store_true",
+                    help="Bỏ qua bước geocoding (Nominatim) sau khi crawl projects")
     args = ap.parse_args()
 
-    asyncio.run(crawl_listings(args.max_pages, args.start_page, args.db))
+    max_lst = args.max_listing_pages or args.max_pages
+
+    if args.mode == "projects":
+        asyncio.run(crawl_projects(args.max_project_pages, args.db,
+                                   inspect=args.inspect, skip_geocode=args.skip_geocode))
+
+    elif args.mode == "listings":
+        asyncio.run(crawl_project_listings(max_lst, args.db))
+
+    elif args.mode == "all":
+        asyncio.run(crawl_projects(args.max_project_pages, args.db,
+                                   inspect=args.inspect, skip_geocode=args.skip_geocode))
+        asyncio.run(crawl_project_listings(max_lst, args.db))
+
+    else:  # generic
+        asyncio.run(crawl_listings(max_lst or args.max_pages, args.start_page, args.db))
