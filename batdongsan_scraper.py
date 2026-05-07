@@ -11,10 +11,17 @@ Schema:
   projects  (project_slug PK, project_name, developer, district, ward,
              status, price_min, price_max, total_units, listing_url,
              lat, lng, geocoded, first_seen, crawl_date, detail_crawled)
-  listings  (listing_id + crawl_month PK, project_slug FK, price_ty,
+  listings  (listing_id + crawl_date PK → mỗi ngày 1 bản ghi / listing,
+             crawl_month derived, project_slug FK, price_ty,
              area_m2, price_per_m2, bedrooms, bathrooms,
-             district, ward, post_date, post_month, title, url, crawl_date)
+             district, ward, post_date, post_month, title, url)
   crawl_runs (id, mode, started_at, finished_at, pages_done, items_new, total_pages)
+
+Dedup:
+  listings: INSERT OR IGNORE với PK (listing_id, crawl_date)
+    → chạy nhiều lần / ngày: không duplicate
+    → chạy hàng ngày: mỗi ngày có 1 snapshot
+    → GROUP BY crawl_month để xem theo tháng
 """
 
 import re
@@ -94,7 +101,7 @@ def init_db(path: str) -> sqlite3.Connection:
             post_date       TEXT,
             post_month      TEXT,
             crawl_date      TEXT,
-            PRIMARY KEY (listing_id, crawl_month)
+            PRIMARY KEY (listing_id, crawl_date)
         )
     """)
     con.execute("""
