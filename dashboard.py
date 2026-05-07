@@ -101,8 +101,8 @@ c2.metric("Tin đăng", f"{stats['n_lst']:,}")
 c3.metric("Có toạ độ", f"{stats['n_geo']:,} / {stats['n_proj']}")
 c4.metric("Crawl gần nhất", stats["last_crawl"] or "—")
 
-tab_proj, tab_lst, tab_chart, tab_map = st.tabs(
-    ["📋 Dự án", "🏷️ Tin đăng", "📊 Biểu đồ", "🗺️ Bản đồ"]
+tab_proj, tab_lst, tab_chart, tab_trend, tab_map = st.tabs(
+    ["📋 Dự án", "🏷️ Tin đăng", "📊 Biểu đồ", "📈 Xu hướng giá", "🗺️ Bản đồ"]
 )
 
 # ─── Tab: Projects ────────────────────────────────────────────────────────────
@@ -290,6 +290,161 @@ with tab_chart:
         fig5 = px.pie(bed_cnt, values="Số tin", names="Số PN", height=400,
                       title="Phân bổ số phòng ngủ")
         st.plotly_chart(fig5, use_container_width=True)
+
+
+# ─── Tab: Xu hướng giá ───────────────────────────────────────────────────────
+with tab_trend:
+    df_trend = load_listings()
+    df_trend = df_trend[
+        df_trend["post_date"].notna() &
+        df_trend["price_per_m2"].notna() &
+        (df_trend["price_per_m2"] > 0)
+    ].copy()
+    df_trend["post_date"] = pd.to_datetime(df_trend["post_date"])
+
+    with st.expander("🔍 Bộ lọc", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+
+        granularity = c1.radio(
+            "Đơn vị thời gian", ["Ngày", "Tuần", "Tháng", "Năm"],
+            horizontal=True, key="trend_gran",
+        )
+        gran_map = {"Ngày": "D", "Tuần": "W", "Tháng": "MS", "Năm": "YS"}
+        gran_fmt = {"Ngày": "%d/%m/%Y", "Tuần": "%d/%m/%Y", "Tháng": "%m/%Y", "Năm": "%Y"}
+
+        metric = c2.radio(
+            "Chỉ số", ["Giá/m² TB (triệu)", "Giá TB (tỷ)", "Số tin đăng"],
+            horizontal=True, key="trend_metric",
+        )
+
+        # Project filter
+        proj_list = ["(tất cả)"] + sorted(df_trend["project_name"].dropna().unique().tolist())
+        sel_projs = c3.multiselect("Dự án (đa chọn)", proj_list[1:], key="trend_proj",
+                                   placeholder="Tất cả dự án")
+
+        # District filter
+        dist_list = ["(tất cả)"] + sorted(df_trend["district"].dropna().unique().tolist())
+        sel_dist  = c4.selectbox("Quận/Huyện", dist_list, key="trend_dist")
+
+    # Apply filters
+    df_t = df_trend.copy()
+    if sel_projs:
+        df_t = df_t[df_t["project_name"].isin(sel_projs)]
+    if sel_dist != "(tất cả)":
+        df_t = df_t[df_t["district"] == sel_dist]
+
+    if df_t.empty:
+        st.warning("Không có data sau khi lọc.")
+    else:
+        # Remove outliers (top 1% price_per_m2)
+        p99 = df_t["price_per_m2"].quantile(0.99)
+        df_t = df_t[df_t["price_per_m2"] <= p99]
+
+        freq = gran_map[granularity]
+        fmt  = gran_fmt[granularity]
+
+        # Group by: project or aggregate
+        group_by_proj = len(sel_projs) > 1
+
+        if group_by_proj:
+            # Multi-project: one line per project
+            records = []
+            for proj, grp in df_t.groupby("project_name"):
+                grp2 = grp.set_index("post_date").resample(freq)
+                if metric == "Giá/m² TB (triệu)":
+                    agg = grp2["price_per_m2"].mean()
+                elif metric == "Giá TB (tỷ)":
+                    agg = grp2["price_ty"].mean()
+                else:
+                    agg = grp2["price_per_m2"].count()
+                agg = agg.dropna()
+                for dt, val in agg.items():
+                    records.append({"Ngày": dt, "Giá trị": val, "Dự án": proj})
+            df_plot = pd.DataFrame(records)
+            color_col = "Dự án"
+        else:
+            # Single or all projects: one aggregated line
+            resampled = df_t.set_index("post_date").resample(freq)
+            if metric == "Giá/m² TB (triệu)":
+                agg = resampled["price_per_m2"].agg(["mean", "median", "count"])
+                agg.columns = ["Trung bình", "Trung vị", "Số tin"]
+            elif metric == "Giá TB (tỷ)":
+                agg = resampled["price_ty"].agg(["mean", "median", "count"])
+                agg.columns = ["Trung bình", "Trung vị", "Số tin"]
+            else:
+                agg = resampled["price_per_m2"].count().rename("Số tin").to_frame()
+                agg["Trung bình"] = agg["Số tin"]
+                agg["Trung vị"] = agg["Số tin"]
+
+            agg = agg[agg["Số tin"] >= 3].reset_index()
+            agg["post_date_str"] = agg["post_date"].dt.strftime(fmt)
+
+            if metric != "Số tin đăng":
+                df_melt = agg[["post_date", "Trung bình", "Trung vị", "Số tin"]].melt(
+                    id_vars=["post_date", "Số tin"],
+                    value_vars=["Trung bình", "Trung vị"],
+                    var_name="Loại", value_name="Giá trị",
+                )
+                df_plot = df_melt.rename(columns={"post_date": "Ngày", "Loại": "Dự án"})
+                color_col = "Dự án"
+            else:
+                df_plot = agg[["post_date", "Số tin"]].rename(
+                    columns={"post_date": "Ngày", "Số tin": "Giá trị"}
+                )
+                df_plot["Dự án"] = "Tất cả"
+                color_col = None
+
+        # Format x-axis labels
+        df_plot["Nhãn"] = df_plot["Ngày"].dt.strftime(fmt)
+
+        y_label = metric
+        title = f"{metric} theo {granularity.lower()}"
+        if sel_projs:
+            title += f" — {', '.join(sel_projs[:3])}" + ("..." if len(sel_projs) > 3 else "")
+        elif sel_dist != "(tất cả)":
+            title += f" — {sel_dist}"
+
+        fig = px.line(
+            df_plot, x="Ngày", y="Giá trị",
+            color=color_col,
+            markers=True,
+            title=title,
+            labels={"Giá trị": y_label, "Ngày": ""},
+            height=480,
+        )
+        fig.update_traces(line_width=2)
+        fig.update_xaxes(tickformat=fmt.replace("%d/%m/%Y", "%d/%m").replace("%m/%Y", "%m/%Y"))
+        fig.update_layout(legend_title_text="")
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Stats table
+        if not group_by_proj and metric != "Số tin đăng":
+            st.subheader("Bảng chi tiết")
+            disp = agg[["post_date_str", "Trung bình", "Trung vị", "Số tin"]].rename(
+                columns={"post_date_str": granularity,
+                         "Trung bình": f"{metric} (TB)",
+                         "Trung vị": f"{metric} (TV)"}
+            )
+            disp[f"{metric} (TB)"] = disp[f"{metric} (TB)"].round(1)
+            disp[f"{metric} (TV)"] = disp[f"{metric} (TV)"].round(1)
+            st.dataframe(disp.sort_values(granularity, ascending=False),
+                         use_container_width=True, hide_index=True)
+
+        # Annotation: min/max periods
+        if not group_by_proj and "Giá trị" in df_plot.columns:
+            agg_single = df_plot[df_plot.get("Dự án", "x") != "Trung vị"] if color_col else df_plot
+            if not agg_single.empty:
+                max_row = agg_single.loc[agg_single["Giá trị"].idxmax()]
+                min_row = agg_single.loc[agg_single["Giá trị"].idxmin()]
+                c1, c2 = st.columns(2)
+                c1.metric(
+                    f"📈 Cao nhất ({max_row['Ngày'].strftime(fmt)})",
+                    f"{max_row['Giá trị']:.1f}",
+                )
+                c2.metric(
+                    f"📉 Thấp nhất ({min_row['Ngày'].strftime(fmt)})",
+                    f"{min_row['Giá trị']:.1f}",
+                )
 
 
 # ─── Tab: Map ─────────────────────────────────────────────────────────────────
