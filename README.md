@@ -214,6 +214,29 @@ CateId=155 (căn hộ chung cư) có 568 dự án nhưng bỏ sót Goldmark City
 | 160 | Khu đô thị mới | 143 |
 | 161 | Khu phức hợp | 33 |
 
+### 5. SQL NULL trap trong NOT IN
+
+`col NOT IN (SELECT ... WHERE ...)` trả về **UNKNOWN** (không phải TRUE/FALSE) nếu subquery chứa bất kỳ NULL nào → toàn bộ rows bị loại.
+
+```sql
+-- SAI: nếu subquery có NULL → không row nào được trả về
+WHERE project_slug NOT IN (SELECT project_slug FROM listings WHERE crawl_date=?)
+
+-- ĐÚNG: filter NULL ra khỏi subquery
+WHERE project_slug NOT IN (
+    SELECT project_slug FROM listings
+    WHERE crawl_date=? AND project_slug IS NOT NULL
+)
+```
+
+Xảy ra ở đây vì backfill `project_slug = NULL` cho non-can-ho listings → subquery chứa NULL → resume query nghĩ tất cả đã crawl xong.
+
+### 6. Không gán project_slug cho listings không thuộc dự án
+
+`nha-dat-ban-{slug}` trả về tất cả BĐS trong khu vực, không chỉ trong dự án. Nhà riêng/shophouse/biệt thự gần một chung cư không phải là "listing của dự án đó".
+
+**Rule:** chỉ gán `project_slug` khi `listing_type == 'can-ho'`. Các loại khác để NULL.
+
 ### Checklist trước khi crawl bulk
 
 - [ ] Test URL pattern thủ công, xác nhận loại data đúng
