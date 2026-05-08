@@ -865,7 +865,7 @@ async def crawl_project_listings(
         WHERE p.listing_url IS NOT NULL AND p.listing_url != ''
           AND p.project_slug NOT IN (
               SELECT DISTINCT project_slug FROM listings
-              WHERE crawl_date = ?
+              WHERE crawl_date = ? AND project_slug IS NOT NULL
           )
         ORDER BY p.project_slug
     """, (crawl_date,)).fetchall()
