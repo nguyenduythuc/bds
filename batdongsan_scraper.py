@@ -139,13 +139,28 @@ def init_db(path: str) -> sqlite3.Connection:
 
     existing_lst = {row[1] for row in con.execute("PRAGMA table_info(listings)")}
     for col, defn in [
-        ("post_date",    "TEXT"),
-        ("post_month",   "TEXT"),
-        ("project_slug", "TEXT"),
+        ("post_date",     "TEXT"),
+        ("post_month",    "TEXT"),
+        ("project_slug",  "TEXT"),
+        ("listing_type",  "TEXT"),  # can-ho | shophouse | nha-rieng | dat | other
     ]:
         if col not in existing_lst:
             con.execute(f"ALTER TABLE listings ADD COLUMN {col} {defn}")
             log.info(f"Migration: added listings.{col}")
+
+    # Backfill listing_type từ url nếu chưa có
+    if "listing_type" not in existing_lst:
+        con.execute("""
+            UPDATE listings SET listing_type = CASE
+                WHEN url LIKE '%/ban-can-ho-chung-cu-%' THEN 'can-ho'
+                WHEN url LIKE '%/ban-shophouse-%'        THEN 'shophouse'
+                WHEN url LIKE '%/ban-nha-rieng-%'        THEN 'nha-rieng'
+                WHEN url LIKE '%/ban-dat-%'              THEN 'dat'
+                WHEN url LIKE '%/ban-nha-biet-thu-%'     THEN 'biet-thu'
+                ELSE 'other'
+            END
+        """)
+        log.info("Migration: backfilled listing_type from url")
 
     existing_runs = {row[1] for row in con.execute("PRAGMA table_info(crawl_runs)")}
     for col, defn in [
@@ -165,21 +180,43 @@ def init_db(path: str) -> sqlite3.Connection:
 
 # ─── Parsing helpers ──────────────────────────────────────────────────────────
 
+def _clean_number(s: str) -> float | None:
+    """
+    Chuẩn hoá chuỗi số VN → float.
+    '11,96' → 11.96  |  '6.583,2' → 6583.2  |  '6.583.2' → None (dị dạng)
+    """
+    s = s.strip()
+    # Trường hợp '6.583,2': dấu . là nghìn, , là thập phân
+    if re.fullmatch(r"\d{1,3}(\.\d{3})+,\d+", s):
+        return float(s.replace(".", "").replace(",", "."))
+    # Trường hợp '11,96': , là thập phân
+    if re.fullmatch(r"\d+,\d+", s):
+        return float(s.replace(",", "."))
+    # Trường hợp '11.96' hoặc '1234': dấu . là thập phân
+    if re.fullmatch(r"\d+(\.\d+)?", s):
+        return float(s)
+    return None
+
+
 def parse_price(text: str) -> float | None:
     """'11,96 tỷ' → 11.96  |  '800 triệu' → 0.8  |  'Thỏa thuận' → None"""
     t = text.lower().strip()
     m = re.search(r"([\d,\.]+)\s*tỷ", t)
     if m:
-        return float(m.group(1).replace(",", "."))
+        v = _clean_number(m.group(1))
+        return v
     m = re.search(r"([\d,\.]+)\s*triệu", t)
     if m:
-        return round(float(m.group(1).replace(",", ".")) / 1000, 4)
+        v = _clean_number(m.group(1))
+        return round(v / 1000, 4) if v is not None else None
     return None
 
 
 def parse_area(text: str) -> float | None:
     m = re.search(r"([\d,\.]+)\s*m", text, re.IGNORECASE)
-    return float(m.group(1).replace(",", ".")) if m else None
+    if not m:
+        return None
+    return _clean_number(m.group(1))
 
 
 def parse_price_m2(text: str) -> float | None:
@@ -411,12 +448,14 @@ def save_listings(con: sqlite3.Connection, listings: list[dict]) -> int:
             con.execute("""
                 INSERT OR IGNORE INTO listings
                     (listing_id, crawl_month, project_slug, title, url,
+                     listing_type,
                      price_ty, area_m2, price_per_m2, bedrooms, bathrooms,
                      district, ward, post_date, post_month, crawl_date)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 item["listing_id"], item["crawl_month"], item["project_slug"],
                 item["title"], item["url"],
+                item.get("listing_type", "other"),
                 item["price_ty"], item["area_m2"], item["price_per_m2"],
                 item["bedrooms"], item["bathrooms"],
                 item["district"], item["ward"],
@@ -536,6 +575,20 @@ def parse_cards(
         href = c.get("href", "")
         url = BASE_URL + href.split("/pr")[0] if href else ""
 
+        # Phân loại BĐS từ URL
+        if "/ban-can-ho-chung-cu-" in href:
+            listing_type = "can-ho"
+        elif "/ban-shophouse-" in href:
+            listing_type = "shophouse"
+        elif "/ban-nha-rieng-" in href:
+            listing_type = "nha-rieng"
+        elif "/ban-dat-" in href:
+            listing_type = "dat"
+        elif "/ban-nha-biet-thu-" in href:
+            listing_type = "biet-thu"
+        else:
+            listing_type = "other"
+
         results.append({
             "listing_id":    lid,
             "crawl_month":   crawl_month,
@@ -543,6 +596,7 @@ def parse_cards(
             "_project_name": project_name,
             "title":         c.get("title", ""),
             "url":           url,
+            "listing_type":  listing_type,
             "price_ty":      price_ty,
             "area_m2":       area_m2,
             "price_per_m2":  price_per_m2,
@@ -769,20 +823,28 @@ async def crawl_project_listings(
     run_start   = now.isoformat()
     total_new   = 0
 
-    # Lấy danh sách dự án có listing_url, ưu tiên dự án chưa crawl tháng này
+    # Lấy dự án chưa có listing nào hôm nay — idempotent, resume-safe
     projects = con.execute("""
-        SELECT project_slug, project_name, listing_url
-        FROM projects
-        WHERE listing_url IS NOT NULL AND listing_url != ''
-        ORDER BY detail_crawled ASC NULLS FIRST
-    """).fetchall()
+        SELECT p.project_slug, p.project_name, p.listing_url
+        FROM projects p
+        WHERE p.listing_url IS NOT NULL AND p.listing_url != ''
+          AND p.project_slug NOT IN (
+              SELECT DISTINCT project_slug FROM listings
+              WHERE crawl_date = ?
+          )
+        ORDER BY p.project_slug
+    """, (crawl_date,)).fetchall()
 
     if not projects:
-        log.warning("Không có dự án nào có listing_url. Chạy --mode projects trước.")
+        log.info("Tất cả dự án đã được crawl hôm nay.")
         con.close()
         return
 
-    log.info(f"Crawl listings cho {len(projects)} dự án | tháng {crawl_month}")
+    total_proj = con.execute(
+        "SELECT count(*) FROM projects WHERE listing_url IS NOT NULL AND listing_url != ''"
+    ).fetchone()[0]
+    already = total_proj - len(projects)
+    log.info(f"Crawl listings: {len(projects)} dự án còn lại | {already} đã có hôm nay | tháng {crawl_month}")
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(

@@ -44,6 +44,7 @@ def load_listings() -> pd.DataFrame:
             l.listing_id, l.project_slug,
             p.project_name,
             l.title, l.url,
+            l.listing_type,
             l.price_ty, l.area_m2, l.price_per_m2,
             l.bedrooms, l.bathrooms,
             l.district, l.ward,
@@ -152,23 +153,27 @@ with tab_lst:
     df_l = load_listings()
 
     with st.expander("🔍 Bộ lọc", expanded=True):
-        c1, c2, c3, c4 = st.columns(4)
+        c0, c1, c2, c3, c4 = st.columns(5)
+        type_opts = ["can-ho", "shophouse", "nha-rieng", "biet-thu", "dat", "other", "(tất cả)"]
+        q_type    = c0.selectbox("Loại BĐS", type_opts, key="lst_type")
         proj_opts = ["(tất cả)"] + sorted(df_l["project_name"].dropna().unique().tolist())
         q_proj    = c1.selectbox("Dự án", proj_opts, key="lst_proj")
         dist_opts = ["(tất cả)"] + sorted(df_l["district"].dropna().unique().tolist())
         q_dist2   = c2.selectbox("Quận", dist_opts, key="lst_dist")
 
         price_min_val = float(df_l["price_ty"].min(skipna=True) or 0)
-        price_max_val = float(df_l["price_ty"].max(skipna=True) or 100)
+        price_max_val = min(float(df_l["price_ty"].max(skipna=True) or 100), 100.0)
         price_range   = c3.slider(
-            "Giá (tỷ)", price_min_val, price_max_val,
-            (price_min_val, price_max_val), step=0.5, key="lst_price",
+            "Giá (tỷ)", 0.0, price_max_val,
+            (0.0, price_max_val), step=0.5, key="lst_price",
         )
 
         months = ["(tất cả)"] + sorted(df_l["crawl_month"].dropna().unique().tolist(), reverse=True)
         q_month = c4.selectbox("Tháng crawl", months, key="lst_month")
 
     mask2 = pd.Series(True, index=df_l.index)
+    if q_type != "(tất cả)":
+        mask2 &= df_l["listing_type"] == q_type
     if q_proj != "(tất cả)":
         mask2 &= df_l["project_name"] == q_proj
     if q_dist2 != "(tất cả)":
@@ -219,7 +224,15 @@ with tab_chart:
     df_l2 = load_listings()
     df_p2 = load_projects()
 
+    chart_type = st.radio(
+        "Loại BĐS", ["can-ho", "shophouse", "nha-rieng", "biet-thu", "(tất cả)"],
+        horizontal=True, key="chart_type",
+    )
     df_valid = df_l2[df_l2["price_per_m2"].notna() & (df_l2["price_per_m2"] > 0)].copy()
+    if chart_type != "(tất cả)":
+        df_valid = df_valid[df_valid["listing_type"] == chart_type]
+    # Bỏ outlier: giá/m² > 500 gần như chắc chắn lỗi dữ liệu nguồn
+    df_valid = df_valid[df_valid["price_per_m2"] <= 500]
 
     c1, c2 = st.columns(2)
 
@@ -298,36 +311,42 @@ with tab_trend:
     df_trend = df_trend[
         df_trend["post_date"].notna() &
         df_trend["price_per_m2"].notna() &
-        (df_trend["price_per_m2"] > 0)
+        (df_trend["price_per_m2"] > 0) &
+        (df_trend["price_per_m2"] <= 500)   # bỏ outlier lỗi nguồn
     ].copy()
     df_trend["post_date"] = pd.to_datetime(df_trend["post_date"])
 
     with st.expander("🔍 Bộ lọc", expanded=True):
-        c1, c2, c3, c4 = st.columns(4)
-
-        granularity = c1.radio(
+        r1c1, r1c2 = st.columns(2)
+        granularity = r1c1.radio(
             "Đơn vị thời gian", ["Ngày", "Tuần", "Tháng", "Năm"],
             horizontal=True, key="trend_gran",
         )
         gran_map = {"Ngày": "D", "Tuần": "W", "Tháng": "MS", "Năm": "YS"}
         gran_fmt = {"Ngày": "%d/%m/%Y", "Tuần": "%d/%m/%Y", "Tháng": "%m/%Y", "Năm": "%Y"}
 
-        metric = c2.radio(
+        metric = r1c2.radio(
             "Chỉ số", ["Giá/m² TB (triệu)", "Giá TB (tỷ)", "Số tin đăng"],
             horizontal=True, key="trend_metric",
         )
 
+        c1, c2, c3, c4 = st.columns(4)
+        trend_type_opts = ["can-ho", "shophouse", "nha-rieng", "biet-thu", "(tất cả)"]
+        sel_type = c1.selectbox("Loại BĐS", trend_type_opts, key="trend_type")
+
         # Project filter
         proj_list = ["(tất cả)"] + sorted(df_trend["project_name"].dropna().unique().tolist())
-        sel_projs = c3.multiselect("Dự án (đa chọn)", proj_list[1:], key="trend_proj",
+        sel_projs = c2.multiselect("Dự án (đa chọn)", proj_list[1:], key="trend_proj",
                                    placeholder="Tất cả dự án")
 
         # District filter
         dist_list = ["(tất cả)"] + sorted(df_trend["district"].dropna().unique().tolist())
-        sel_dist  = c4.selectbox("Quận/Huyện", dist_list, key="trend_dist")
+        sel_dist  = c3.selectbox("Quận/Huyện", dist_list, key="trend_dist")
 
     # Apply filters
     df_t = df_trend.copy()
+    if sel_type != "(tất cả)":
+        df_t = df_t[df_t["listing_type"] == sel_type]
     if sel_projs:
         df_t = df_t[df_t["project_name"].isin(sel_projs)]
     if sel_dist != "(tất cả)":
