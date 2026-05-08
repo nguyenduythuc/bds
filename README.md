@@ -155,3 +155,70 @@ Phase 2: Per-Project Listings (--mode listings)
 ```
 
 Cloudflare bypass: Playwright load trang 1 lần, sau đó dùng `page.evaluate(fetch(...))` trong browser context để gọi API — tránh TLS fingerprint mismatch.
+
+---
+
+## Lessons Learned
+
+### 1. Hiểu URL endpoint trước khi crawl bulk
+
+`nha-dat-ban-{slug}` trả về **tất cả loại BĐS** (shophouse, nhà riêng, biệt thự lẫn căn hộ).  
+Đúng phải dùng `ban-can-ho-chung-cu-{slug}` nếu chỉ muốn căn hộ.
+
+**Rule:** test URL thủ công trên browser, xác định đúng loại data trả về trước khi code. Lưu `listing_type` từ URL để filter sau.
+
+### 2. User-entered data không tin được
+
+Giá trên batdongsan do người bán nhập — lỗi chính tả thường xuyên (`575` thay vì `5,75 tỷ`). Không thể fix, chỉ có thể detect.
+
+**Rule:** luôn lưu raw value + flag outlier. Không silently drop/fix.
+
+```sql
+-- Chạy sau mỗi crawl để kiểm tra data quality
+SELECT count(*) suspicious
+FROM listings
+WHERE price_per_m2 > 500 OR price_per_m2 < 5;
+```
+
+Schema nên có:
+```sql
+price_ty_raw  TEXT,            -- chuỗi gốc từ trang
+price_flagged INTEGER DEFAULT 0 -- 1 = nghi ngờ outlier
+```
+
+### 3. Parser crash = mất data, không có resume
+
+`ValueError: could not convert string to float: '6.583.2'` crash process tại project 176/760 → 584 project mất. Không có resume → phải crawl lại từ đầu.
+
+**Rule:**
+- Mọi parse function phải `try/except → return None`, không bao giờ raise
+- Crawl loop phải idempotent + resumable từ đầu (skip rows đã có `crawl_date = hôm nay`)
+- Unit test parser trên edge cases trước khi chạy bulk:
+
+```python
+assert parse_price("6.583.2 tỷ") is None  # không crash
+assert parse_price("5,75 tỷ")   == 5.75
+assert parse_price("575 tỷ")    == 575.0  # đúng — lỗi nguồn, không phải lỗi parser
+```
+
+### 4. Không phải tất cả dự án nằm trong một category API
+
+CateId=155 (căn hộ chung cư) có 568 dự án nhưng bỏ sót Goldmark City, Ecopark... vì chúng nằm ở CateId=160 (khu đô thị mới) và CateId=161 (khu phức hợp).
+
+**Rule:** khi lần đầu crawl một nguồn mới, brute-force tất cả category IDs để tìm đủ data. Map rõ CateId → tên category:
+
+| CateId | Category | Dự án HN |
+|---|---|---|
+| 155 | Căn hộ chung cư | 568 |
+| 158 | Nhà ở xã hội | 16 |
+| 160 | Khu đô thị mới | 143 |
+| 161 | Khu phức hợp | 33 |
+
+### Checklist trước khi crawl bulk
+
+- [ ] Test URL pattern thủ công, xác nhận loại data đúng
+- [ ] Xác định đủ category/filter IDs (không bỏ sót)
+- [ ] Mọi parser có `try/except → None`
+- [ ] Crawl loop idempotent + resumable
+- [ ] Schema có `*_type` discriminator, raw value, outlier flag
+- [ ] Có validation query chạy sau crawl
