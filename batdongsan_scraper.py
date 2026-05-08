@@ -826,7 +826,10 @@ async def _crawl_one_project(page, base: str, slug: str, max_pages: int,
         raw   = await page.evaluate(EXTRACT_JS)
         cards = parse_cards(raw, crawl_date, crawl_month, now)
         for c in cards:
-            c["project_slug"] = slug
+            # Chỉ gán project_slug cho căn hộ — nhà riêng/shophouse/biệt thự
+            # trong khu vực không thuộc dự án, không nên gán nhầm
+            if c.get("listing_type") == "can-ho":
+                c["project_slug"] = slug
         return save_listings(con, cards)
 
     new = await do_page()

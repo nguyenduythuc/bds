@@ -237,21 +237,41 @@ with tab_chart:
     c1, c2 = st.columns(2)
 
     with c1:
-        st.subheader("Giá/m² trung bình theo dự án (top 20)")
-        avg_proj = (
-            df_valid.groupby("project_name")["price_per_m2"]
-            .mean()
-            .nlargest(20)
-            .reset_index()
-            .rename(columns={"project_name": "Dự án", "price_per_m2": "Giá/m² (triệu)"})
-        )
-        fig1 = px.bar(
-            avg_proj, x="Giá/m² (triệu)", y="Dự án",
-            orientation="h", height=500,
-            color="Giá/m² (triệu)", color_continuous_scale="RdYlGn_r",
-        )
-        fig1.update_layout(showlegend=False, yaxis={"categoryorder": "total ascending"})
-        st.plotly_chart(fig1, use_container_width=True)
+        if chart_type in ("can-ho", "(tất cả)"):
+            st.subheader("Giá/m² trung bình theo dự án (top 20)")
+            df_proj_chart = df_valid[df_valid["project_name"].notna() & (df_valid["listing_type"] == "can-ho")]
+            avg_proj = (
+                df_proj_chart.groupby("project_name")["price_per_m2"]
+                .mean()
+                .nlargest(20)
+                .reset_index()
+                .rename(columns={"project_name": "Dự án", "price_per_m2": "Giá/m² (triệu)"})
+            )
+            fig1 = px.bar(
+                avg_proj, x="Giá/m² (triệu)", y="Dự án",
+                orientation="h", height=500,
+                color="Giá/m² (triệu)", color_continuous_scale="RdYlGn_r",
+            )
+            fig1.update_layout(showlegend=False, yaxis={"categoryorder": "total ascending"})
+            st.plotly_chart(fig1, use_container_width=True)
+        else:
+            st.subheader("Giá/m² trung bình theo quận (top 20)")
+            st.caption(f"⚠️ '{chart_type}' không gắn với dự án cụ thể — hiển thị theo quận")
+            avg_dist = (
+                df_valid[df_valid["district"].notna()]
+                .groupby("district")["price_per_m2"]
+                .mean()
+                .nlargest(20)
+                .reset_index()
+                .rename(columns={"district": "Quận", "price_per_m2": "Giá/m² (triệu)"})
+            )
+            fig1 = px.bar(
+                avg_dist, x="Giá/m² (triệu)", y="Quận",
+                orientation="h", height=500,
+                color="Giá/m² (triệu)", color_continuous_scale="RdYlGn_r",
+            )
+            fig1.update_layout(showlegend=False, yaxis={"categoryorder": "total ascending"})
+            st.plotly_chart(fig1, use_container_width=True)
 
     with c2:
         st.subheader("Phân phối giá/m²")
