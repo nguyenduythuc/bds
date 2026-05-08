@@ -47,7 +47,12 @@ LIST_URL          = f"{BASE_URL}/{LIST_SLUG}"
 PROJECT_LIST_URL  = f"{BASE_URL}/du-an/can-ho-chung-cu-ha-noi"
 PROJECT_API_URL   = (f"{BASE_URL}/microservice-architecture-router"
                      f"/ProjectNet/ProjectSearch/GetProjectListData")
-PROJECT_CATE_ID   = 155   # can-ho-chung-cu
+# Categories có chứa chung cư Hà Nội (verified 2026-05):
+#   155 = Căn hộ chung cư (568 dự án)
+#   158 = Nhà ở xã hội     (16 dự án)
+#   160 = Khu đô thị mới  (143 dự án) — Goldmark City, Ecopark...
+#   161 = Khu phức hợp     (33 dự án)
+PROJECT_CATE_IDS  = [155, 158, 160, 161]
 PROJECT_CITY_CODE = "HN"
 PROJECT_PAGE_SIZE = 10    # cards per page (confirmed from API)
 DB_PATH           = "batdongsan.db"
@@ -569,9 +574,9 @@ async def nav_with_retry(page, url: str, selector: str = ".re__card-full", retri
 
 # ─── Project API helpers ──────────────────────────────────────────────────────
 
-def _api_body(page_index: int) -> str:
+def _api_body(page_index: int, cate_id: int) -> str:
     params = {
-        "TextSearch": "", "CateId": PROJECT_CATE_ID, "CityCode": PROJECT_CITY_CODE,
+        "TextSearch": "", "CateId": cate_id, "CityCode": PROJECT_CITY_CODE,
         "DistrictId": 0, "PriceLevel": -1, "PriceMin": -1, "PriceMax": -1,
         "LegacyId": 0, "StagesAsString": "", "OrderBy": 1, "PageIndex": page_index,
     }
@@ -643,16 +648,17 @@ def parse_project_cards(html: str, crawl_date: str, crawl_month: str, con) -> in
 
 async def crawl_projects(max_pages: int, db_path: str, inspect: bool = False, skip_geocode: bool = False) -> None:
     """
-    Khám phá tất cả dự án chung cư HN qua API.
-    Playwright chỉ dùng 1 lần để bypass Cloudflare,
-    sau đó dùng page.evaluate(fetch()) cho mọi trang — không cần navigate.
+    Khám phá tất cả dự án chung cư HN qua API — crawl đa category.
+    PROJECT_CATE_IDS: [155=căn hộ, 158=NOXH, 160=khu đô thị, 161=khu phức hợp]
+    Playwright chỉ load 1 lần để bypass Cloudflare,
+    sau đó dùng page.evaluate(fetch()) cho mọi trang và category.
     """
     con = init_db(db_path)
     now = datetime.now()
     crawl_date  = now.strftime("%Y-%m-%d")
     crawl_month = now.strftime("%Y-%m")
     run_start   = now.isoformat()
-    pages_done  = projects_new = total_pages = 0
+    pages_done  = projects_new = total_pages_all = 0
 
     FETCH_JS = f"""async (body) => {{
         const resp = await fetch('{PROJECT_API_URL}', {{
@@ -683,77 +689,70 @@ async def crawl_projects(max_pages: int, db_path: str, inspect: bool = False, sk
             log.error("Không load được trang dự án.")
             await browser.close()
             return
-        log.info("Page loaded. Dùng API cho tất cả trang tiếp theo.")
+        log.info(f"Page loaded. Crawl {len(PROJECT_CATE_IDS)} categories: {PROJECT_CATE_IDS}")
 
-        async def fetch_page(page_index: int) -> dict | None:
-            """Gọi API qua fetch() trong browser context. Trả về parsed JSON."""
+        async def fetch_page(page_index: int, cate_id: int) -> dict | None:
             for attempt in range(1, 4):
                 try:
-                    result = await page.evaluate(FETCH_JS, _api_body(page_index))
+                    result = await page.evaluate(FETCH_JS, _api_body(page_index, cate_id))
                     if result["status"] != 200:
-                        log.warning(f"  API trang {page_index} status={result['status']}")
+                        log.warning(f"  API cate={cate_id} trang {page_index} status={result['status']}")
                         return None
                     return json.loads(result["text"])
                 except Exception as e:
-                    log.warning(f"  fetch_page({page_index}) lần {attempt}: {e}")
+                    log.warning(f"  fetch_page(cate={cate_id}, pg={page_index}) lần {attempt}: {e}")
                     if attempt < 3:
                         await asyncio.sleep(attempt * 2)
             return None
 
-        # Trang 1: lấy total count để tính total_pages
-        data = await fetch_page(1)
-        if not data:
-            log.error("Không lấy được data trang 1.")
-            await browser.close()
-            return
-
-        html1 = data.get("projectListContent", "")
-
-        # Extract total từ "568 </span> dự án"
-        m_total = re.search(r"(\d+)\s*</span>\s*dự\s*án", html1)
-        total_projects = int(m_total.group(1)) if m_total else 0
-        total_pages = math.ceil(total_projects / PROJECT_PAGE_SIZE) if total_projects else 1
-        if max_pages > 0:
-            total_pages = min(total_pages, max_pages)
-        log.info(f"Tổng dự án: {total_projects} → {total_pages} trang")
-
-        # Sanity check: cảnh báo nếu số dự án bất thường thấp
-        MIN_EXPECTED_PROJECTS = 200
-        if total_projects > 0 and total_projects < MIN_EXPECTED_PROJECTS and max_pages == 0:
-            log.warning(
-                f"⚠️  Chỉ tìm thấy {total_projects} dự án (kỳ vọng ≥ {MIN_EXPECTED_PROJECTS}). "
-                f"API có thể trả về HTML không đầy đủ — kiểm tra lại selector hoặc chạy lại."
-            )
-
-        new = parse_project_cards(html1, crawl_date, crawl_month, con)
-        projects_new += new
-        pages_done   += 1
-        log.info(f"Trang 1/{total_pages} — +{new} dự án")
-
-        for pnum in range(2, total_pages + 1):
-            await asyncio.sleep(PAGE_DELAY)
-            data = await fetch_page(pnum)
+        for cate_id in PROJECT_CATE_IDS:
+            log.info(f"─── Category {cate_id} ───")
+            data = await fetch_page(1, cate_id)
             if not data:
-                log.warning(f"Bỏ qua trang {pnum}")
+                log.error(f"Không lấy được data trang 1 cate={cate_id}.")
                 continue
-            new = parse_project_cards(data.get("projectListContent", ""), crawl_date, crawl_month, con)
+
+            html1 = data.get("projectListContent", "")
+            m_total = re.search(r"(\d+)\s*</span>\s*dự\s*án", html1)
+            total_projects = int(m_total.group(1)) if m_total else 0
+            total_pages = math.ceil(total_projects / PROJECT_PAGE_SIZE) if total_projects else 1
+            if max_pages > 0:
+                total_pages = min(total_pages, max_pages)
+            log.info(f"  Tổng: {total_projects} dự án → {total_pages} trang")
+            total_pages_all += total_pages
+
+            new = parse_project_cards(html1, crawl_date, crawl_month, con)
             projects_new += new
             pages_done   += 1
-            log.info(f"Trang {pnum}/{total_pages} — +{new} dự án (tổng: {projects_new})")
+            log.info(f"  Cate {cate_id} trang 1/{total_pages} — +{new}")
+
+            for pnum in range(2, total_pages + 1):
+                await asyncio.sleep(PAGE_DELAY)
+                data = await fetch_page(pnum, cate_id)
+                if not data:
+                    log.warning(f"  Bỏ qua cate={cate_id} trang {pnum}")
+                    continue
+                new = parse_project_cards(data.get("projectListContent", ""), crawl_date, crawl_month, con)
+                projects_new += new
+                pages_done   += 1
+                log.info(f"  Cate {cate_id} trang {pnum}/{total_pages} — +{new} (tổng: {projects_new})")
+
+            await asyncio.sleep(PAGE_DELAY * 2)
 
         await browser.close()
 
+    total_in_db = con.execute("SELECT count(*) FROM projects").fetchone()[0]
     con.execute("""
         INSERT INTO crawl_runs (mode, started_at, finished_at, pages_done, items_new, total_pages)
         VALUES (?,?,?,?,?,?)
-    """, ("projects", run_start, datetime.now().isoformat(), pages_done, projects_new, total_pages))
+    """, ("projects", run_start, datetime.now().isoformat(), pages_done, projects_new, total_pages_all))
     con.commit()
+    log.info(f"Projects xong: {projects_new} dự án mới, {total_in_db} tổng trong DB.")
     if not skip_geocode:
         geocode_all_projects(con)
     else:
-        log.info("Skip geocoding (--skip-geocode). Chạy lại không có flag để geocode.")
+        log.info("Skip geocoding (--skip-geocode).")
     con.close()
-    log.info(f"Projects xong: {projects_new} dự án từ {pages_done} trang.")
 
 
 # ─── Crawl: per-project listings ─────────────────────────────────────────────
