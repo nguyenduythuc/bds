@@ -709,13 +709,21 @@ async def crawl_projects(max_pages: int, db_path: str, inspect: bool = False, sk
 
         html1 = data.get("projectListContent", "")
 
-        # Extract total từ "Hiện đang có 127 dự án"
-        m_total = re.search(r"(\d+)\s*</span>\s*dự án", html1)
+        # Extract total từ "568 </span> dự án"
+        m_total = re.search(r"(\d+)\s*</span>\s*dự\s*án", html1)
         total_projects = int(m_total.group(1)) if m_total else 0
         total_pages = math.ceil(total_projects / PROJECT_PAGE_SIZE) if total_projects else 1
         if max_pages > 0:
             total_pages = min(total_pages, max_pages)
         log.info(f"Tổng dự án: {total_projects} → {total_pages} trang")
+
+        # Sanity check: cảnh báo nếu số dự án bất thường thấp
+        MIN_EXPECTED_PROJECTS = 200
+        if total_projects > 0 and total_projects < MIN_EXPECTED_PROJECTS and max_pages == 0:
+            log.warning(
+                f"⚠️  Chỉ tìm thấy {total_projects} dự án (kỳ vọng ≥ {MIN_EXPECTED_PROJECTS}). "
+                f"API có thể trả về HTML không đầy đủ — kiểm tra lại selector hoặc chạy lại."
+            )
 
         new = parse_project_cards(html1, crawl_date, crawl_month, con)
         projects_new += new
