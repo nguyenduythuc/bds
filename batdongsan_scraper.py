@@ -809,6 +809,38 @@ async def crawl_projects(max_pages: int, db_path: str, inspect: bool = False, sk
     con.close()
 
 
+async def _crawl_one_project(page, base: str, slug: str, max_pages: int,
+                              crawl_date: str, crawl_month: str,
+                              now: datetime, con) -> int:
+    """Crawl tất cả trang listing của 1 dự án. Trả về số tin mới."""
+    ok = await nav_with_retry(page, base, ".re__card-full", retries=2)
+    if not ok:
+        log.warning(f"    Skip {slug} — không load được")
+        return 0
+
+    tot = await page.evaluate(PAGINATION_JS)
+    if max_pages > 0:
+        tot = min(tot, max_pages)
+
+    async def do_page() -> int:
+        raw   = await page.evaluate(EXTRACT_JS)
+        cards = parse_cards(raw, crawl_date, crawl_month, now)
+        for c in cards:
+            c["project_slug"] = slug
+        return save_listings(con, cards)
+
+    new = await do_page()
+    for pnum in range(2, tot + 1):
+        await asyncio.sleep(PAGE_DELAY)
+        url = f"{base}/p{pnum}"
+        ok2 = await nav_with_retry(page, url, ".re__card-full", retries=2)
+        if ok2:
+            new += await do_page()
+        else:
+            log.warning(f"    Skip trang {pnum} của {slug}")
+    return new
+
+
 # ─── Crawl: per-project listings ─────────────────────────────────────────────
 
 async def crawl_project_listings(
@@ -856,42 +888,30 @@ async def crawl_project_listings(
         )
         page = await ctx.new_page()
 
+        PROJECT_TIMEOUT = 120  # giây tối đa cho 1 dự án (tránh hang vô hạn)
+
         for slug, name, listing_url in projects:
             base = BASE_URL + "/" + listing_url.lstrip("/")
             log.info(f"  Dự án: {name} [{slug}] → {base}")
 
-            ok = await nav_with_retry(page, base, ".re__card-full", retries=2)
-            if not ok:
-                log.warning(f"  Skip {slug} — không load được trang listing")
-                continue
+            try:
+                proj_new = await asyncio.wait_for(
+                    _crawl_one_project(page, base, slug, max_pages,
+                                       crawl_date, crawl_month, now, con),
+                    timeout=PROJECT_TIMEOUT,
+                )
+                total_new += proj_new
+                log.info(f"  ✓ {name}: +{proj_new} tin mới")
+            except asyncio.TimeoutError:
+                log.warning(f"  ⏱ Timeout {PROJECT_TIMEOUT}s — skip {slug}, tạo page mới")
+                try:
+                    await page.close()
+                    page = await ctx.new_page()
+                except Exception:
+                    pass
+            except Exception as e:
+                log.warning(f"  ✗ Lỗi {slug}: {e}")
 
-            tot = await page.evaluate(PAGINATION_JS)
-            if max_pages > 0:
-                tot = min(tot, max_pages)
-
-            proj_new = 0
-
-            async def do_page() -> int:
-                raw   = await page.evaluate(EXTRACT_JS)
-                cards = parse_cards(raw, crawl_date, crawl_month, now)
-                for c in cards:
-                    # Override project_slug về slug đã biết
-                    c["project_slug"] = slug
-                return save_listings(con, cards)
-
-            proj_new += await do_page()
-
-            for pnum in range(2, tot + 1):
-                await asyncio.sleep(PAGE_DELAY)
-                url = f"{base}/p{pnum}"
-                ok = await nav_with_retry(page, url, ".re__card-full", retries=2)
-                if not ok:
-                    log.warning(f"  Skip trang {pnum} của {slug}")
-                    continue
-                proj_new += await do_page()
-
-            total_new += proj_new
-            log.info(f"  ✓ {name}: +{proj_new} tin mới")
             await asyncio.sleep(PAGE_DELAY)
 
         await browser.close()
