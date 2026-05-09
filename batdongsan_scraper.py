@@ -681,7 +681,8 @@ def parse_project_cards(html: str, crawl_date: str, crawl_month: str, con) -> in
             continue
 
         district, ward = parse_district_ward(location)
-        listing_url = f"nha-dat-ban-{slug}"
+        # ban-can-ho-chung-cu-{slug} = chỉ căn hộ, không lẫn shophouse/biệt thự
+        listing_url = f"ban-can-ho-chung-cu-{slug}"
 
         upsert_project(
             con, slug, name, district, ward, crawl_month, crawl_date,
